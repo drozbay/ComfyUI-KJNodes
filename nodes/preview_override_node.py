@@ -4,12 +4,14 @@ import logging
 import queue
 import threading
 import time
+import wave
 
 import numpy as np
 import torch
 
 import comfy.model_management
 import comfy.patcher_extension
+import comfy.utils
 import latent_preview
 from comfy_api.latest import io
 from PIL import Image, ImageOps
@@ -276,17 +278,17 @@ def _ltx_decode_to_pil(ltx_previewer, x0_5d, max_frames=None, stride=1):
     return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
 
 
-def _ltx_full_vae_decode_to_pil(vae, x0_5d, max_frames=None, stride=1):
-    # vae.decode handles device + tiling. Slow vs TAEHV but full quality. Output shape
-    # varies by VAE; we accept (B, T, H, W, C) or (T, H, W, C) and normalize.
-    if vae is None or x0_5d.ndim != 5:
+def _full_vae_decode_to_pil(vae, x0, latent_format=None, max_frames=None, stride=1):
+    # latent_format.process_out converts sampler x0 to the VAE's latent space; None decodes as-is.
+    if vae is None or x0.ndim not in (4, 5):
         return []
-    if stride > 1:
-        x0_5d = x0_5d[:, :, ::stride]
+    x = latent_format.process_out(x0) if latent_format is not None else x0
+    if stride > 1 and x.ndim == 5:
+        x = x[:, :, ::stride]
     try:
-        images = vae.decode(x0_5d)
+        images = vae.decode(x)
     except Exception as e:
-        logging.warning(f"[KJ PreviewOverride] LTX VAE decode failed: {e}")
+        logging.warning(f"[KJ PreviewOverride] VAE decode failed: {e}")
         return []
     if images.ndim == 5:
         images = images[0]
@@ -298,6 +300,46 @@ def _ltx_full_vae_decode_to_pil(vae, x0_5d, max_frames=None, stride=1):
         images = images[indices]
     u8 = (images.float() * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
     return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
+
+
+def _decode_audio_waveform(audio_first_stage, ax, target_device):
+    if ax is None or ax.numel() == 0:
+        return None
+    try:
+        ax = ax.to(device=target_device, dtype=torch.float32)
+        waveform = audio_first_stage.decode(ax)
+    except Exception as e:
+        logging.warning(f"[KJ PreviewOverride] audio VAE decode failed: {e}")
+        return None
+    if waveform.ndim == 2:
+        waveform = waveform.unsqueeze(1)
+    if waveform.ndim != 3:
+        return None
+    # Loudness normalization matching comfy_extras.nodes_audio.vae_decode_audio.
+    std = torch.std(waveform, dim=[1, 2], keepdim=True) * 5.0
+    std[std < 1.0] = 1.0
+    waveform = waveform / std
+    return waveform[0].clamp(-1.0, 1.0).detach().float().cpu()
+
+
+def _encode_wav_b64(waveform_cpu, sample_rate):
+    # waveform_cpu: (C, samples) in [-1, 1].
+    if waveform_cpu is None or waveform_cpu.numel() == 0:
+        return None
+    try:
+        channels = waveform_cpu.shape[0]
+        interleaved = (waveform_cpu.transpose(0, 1).contiguous().numpy() * 32767.0)
+        interleaved = np.clip(interleaved, -32768, 32767).astype("<i2")
+        buf = pyio.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(int(channels))
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes(interleaved.tobytes())
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logging.warning(f"[KJ PreviewOverride] WAV encode failed: {e}")
+        return None
 
 
 def _is_ltx_latent_format(latent_format):
@@ -341,7 +383,7 @@ def _normalize_ltx_x0(x0, latent_shapes, num_keyframes):
 
 
 class _PreviewOverrideWrapper:
-    def __init__(self, max_resolution, node_id, jpeg_quality, suppress_default, preview_frames=1, preview_fps=12, vae=None):
+    def __init__(self, max_resolution, node_id, jpeg_quality, suppress_default, preview_frames=1, preview_fps=12, vae=None, audio_vae=None):
         self.max_resolution = max_resolution
         self.node_id = str(node_id) if node_id is not None else None
         self.jpeg_quality = jpeg_quality
@@ -349,6 +391,7 @@ class _PreviewOverrideWrapper:
         self.preview_frames = preview_frames
         self.preview_fps = preview_fps
         self.vae = vae
+        self.audio_vae = audio_vae
         self.frames = []
 
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes):
@@ -387,6 +430,29 @@ class _PreviewOverrideWrapper:
                 ltx_previewer = _LTXWrappedPreviewer(factors, bias, rate=8, taeltx=taeltx)
             except Exception as e:
                 logging.warning(f"[KJ PreviewOverride] LTX previewer setup failed: {e}")
+
+        full_vae = self.vae if (not is_ltx and self.vae is not None) else None
+
+        # More than one entry in latent_shapes means an audio latent is packed after the video one (LTXAV).
+        audio_first_stage = None
+        audio_target_device = None
+        audio_restore_device = None
+        audio_sample_rate = 44100
+        if self.audio_vae is not None and len(latent_shapes) > 1:
+            try:
+                audio_target_device = comfy.model_management.get_torch_device()
+                for p in self.audio_vae.first_stage_model.parameters():
+                    audio_restore_device = p.device
+                    break
+                self.audio_vae.first_stage_model.to(audio_target_device)
+                audio_first_stage = self.audio_vae.first_stage_model
+                audio_sample_rate = getattr(
+                    self.audio_vae, "audio_sample_rate_output",
+                    getattr(self.audio_vae, "audio_sample_rate", 44100),
+                )
+            except Exception as e:
+                logging.warning(f"[KJ PreviewOverride] audio VAE setup failed: {e}")
+                audio_first_stage = None
 
         previewer = _get_core_previewer(model_patcher.load_device, model_patcher.model.latent_format)
         # Latent2RGB fallback — used when the active previewer returns a non-PIL result
@@ -495,8 +561,12 @@ class _PreviewOverrideWrapper:
 
                     pil_frames = []
                     max_pil = anim_frames if animate_video else 1
-                    if ltx_full_vae is not None and x0_view.ndim == 5:
-                        pil_frames = _ltx_full_vae_decode_to_pil(ltx_full_vae, x0_view, max_frames=max_pil)
+                    if full_vae is not None and x0_view.ndim in (4, 5):
+                        pil_frames = _full_vae_decode_to_pil(
+                            full_vae, x0_view, model_patcher.model.latent_format, max_frames=max_pil,
+                        )
+                    if not pil_frames and ltx_full_vae is not None and x0_view.ndim == 5:
+                        pil_frames = _full_vae_decode_to_pil(ltx_full_vae, x0_view, max_frames=max_pil)
                     if not pil_frames and ltx_previewer is not None and x0_view.ndim == 5:
                         try:
                             pil_frames = _ltx_decode_to_pil(ltx_previewer, x0_view, max_frames=max_pil)
@@ -557,10 +627,22 @@ class _PreviewOverrideWrapper:
                         sigma_val = sigmas_list[step] if 0 <= step < len(sigmas_list) else None
                         sent_step = step + 1
 
+                        audio_wave_cpu = None
+                        if audio_first_stage is not None:
+                            try:
+                                unpacked = comfy.utils.unpack_latents(x0, latent_shapes)
+                                if len(unpacked) > 1:
+                                    audio_wave_cpu = _decode_audio_waveform(
+                                        audio_first_stage, unpacked[1], audio_target_device,
+                                    )
+                            except Exception as e:
+                                logging.warning(f"[KJ PreviewOverride] audio extract failed: {e}")
+
                         def _encode_and_send(
                             pil_frames=pil_frames, x0_cpu_now=x0_cpu_now, prev_x0_cpu=prev_x0_cpu,
                             step_ms=step_ms, avg_step_ms=avg_step_ms, sigma_val=sigma_val,
                             sent_step=sent_step, total_steps_=total_steps_,
+                            audio_wave_cpu=audio_wave_cpu, audio_sample_rate=audio_sample_rate,
                         ):
                             if len(pil_frames) > 1:
                                 # NVENC ~8x faster + ~5x smaller than PIL WebP when available.
@@ -590,24 +672,29 @@ class _PreviewOverrideWrapper:
                                 diff = x0_cpu_now - prev_x0_cpu
                                 delta_v = (diff.norm() / max(1, diff.numel()) ** 0.5).item()
 
+                            payload = {
+                                "node_id": node_id,
+                                "image": b64,
+                                "mime": mime,
+                                "w": w_,
+                                "h": h_,
+                                "step": sent_step,
+                                "total": total_steps_,
+                                "sigma": sigma_val,
+                                "sigmas": None,
+                                "delta": delta_v,
+                                "step_ms": step_ms,
+                                "avg_step_ms": avg_step_ms,
+                                "fps": anim_fps if mime in ("video/mp4", "image/webp") else None,
+                            }
+                            audio_b64 = _encode_wav_b64(audio_wave_cpu, audio_sample_rate)
+                            if audio_b64 is not None:
+                                payload["audio"] = audio_b64
+                                payload["audio_sample_rate"] = int(audio_sample_rate)
+                                payload["audio_mime"] = "audio/wav"
+
                             PromptServer.instance.send_sync(
-                                "kj_preview_override",
-                                {
-                                    "node_id": node_id,
-                                    "image": b64,
-                                    "mime": mime,
-                                    "w": w_,
-                                    "h": h_,
-                                    "step": sent_step,
-                                    "total": total_steps_,
-                                    "sigma": sigma_val,
-                                    "sigmas": None,
-                                    "delta": delta_v,
-                                    "step_ms": step_ms,
-                                    "avg_step_ms": avg_step_ms,
-                                    "fps": anim_fps if mime in ("video/mp4", "image/webp") else None,
-                                },
-                                PromptServer.instance.client_id,
+                                "kj_preview_override", payload, PromptServer.instance.client_id,
                             )
 
                         encoder.submit(_encode_and_send)
@@ -641,6 +728,11 @@ class _PreviewOverrideWrapper:
             if vae_restore_device is not None and self.vae is not None:
                 try:
                     self.vae.first_stage_model.to(vae_restore_device)
+                except Exception:
+                    pass
+            if audio_restore_device is not None and self.audio_vae is not None:
+                try:
+                    self.audio_vae.first_stage_model.to(audio_restore_device)
                 except Exception:
                     pass
 
@@ -702,9 +794,16 @@ class ModelPreviewOverrideKJ(io.ComfyNode):
                 io.Vae.Input(
                     "vae",
                     optional=True,
-                    tooltip="Optional LTX VAE for true-RGB previews. TAEHV-LTX = fast tiny decode "
-                            "(VAE pinned to GPU). Any other LTX VAE = full-quality decode via "
-                            "vae.decode() — MUCH slower per step.",
+                    tooltip="Optional VAE/TAE used to decode every step's preview, like running "
+                            "VAEDecode per step. Connect a full VAE for exact previews (slow) or a "
+                            "TAE for fast approximate ones. Works for any model. Leave unconnected "
+                            "to use the model's built-in TAESD/latent2RGB approximation.",
+                ),
+                io.Vae.Input(
+                    "audio_vae",
+                    optional=True,
+                    tooltip="Optional LTXAV audio VAE. When connected, the audio is decoded and "
+                            "previewed in sync with the video during sampling.",
                 ),
             ],
             outputs=[io.Model.Output(tooltip="Model with preview override attached.")],
@@ -713,14 +812,14 @@ class ModelPreviewOverrideKJ(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, max_resolution, jpeg_quality, suppress_default_preview, preview_frames, preview_fps, vae=None) -> io.NodeOutput:
+    def execute(cls, model, max_resolution, jpeg_quality, suppress_default_preview, preview_frames, preview_fps, vae=None, audio_vae=None) -> io.NodeOutput:
         m = model.clone()
         m.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
             "kj_preview_override",
             _PreviewOverrideWrapper(
                 max_resolution, cls.hidden.unique_id, jpeg_quality, suppress_default_preview,
-                preview_frames, preview_fps, vae,
+                preview_frames, preview_fps, vae, audio_vae,
             ),
         )
         return io.NodeOutput(m)
